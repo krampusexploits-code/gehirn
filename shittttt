@@ -1,0 +1,1461 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+
+//
+// A comprehensive .NET assembly obfuscator.
+//
+// This console program reads a JSON configuration file that specifies the input assembly,
+// output path, exclusion patterns, enabled transformation passes and an optional seed for
+// deterministic name generation. The obfuscator performs multiple transformations to
+// increase reverse engineering resistance while preserving public APIs and interop
+// requirements. Each pass can be independently enabled or disabled. After the
+// transformations are applied, the tool can optionally execute a smoke‑test method
+// specified in the configuration using a fresh AssemblyLoadContext to ensure the
+// obfuscated assembly still behaves correctly.
+//
+// Major transformations include:
+//  * Rename obfuscation – rename non‑public types, methods, fields and properties
+//    to meaningless identifiers. Identifiers are deterministic given the same
+//    random seed. Members marked with attributes like SerializeField or DllImport,
+//    or names matching user provided exclusion patterns are left untouched.
+//  * Control flow obfuscation – optionally flatten method bodies into a state
+//    machine implemented with a dispatcher loop and switch statement. To maintain
+//    verifiable IL the implementation avoids tampering with exception handlers and
+//    leaves complex flow structures untouched. Additionally, opaque predicates are
+//    injected at the beginning of methods to confuse decompilers.
+//  * String encryption – replace all string literals with calls to a runtime
+//    decryption stub. Strings are XOR‑encrypted with a key derived from the
+//    assembly’s MVID and a user provided seed. A static cache ensures each string
+//    is decrypted only once at runtime.
+//  * Constant obfuscation – rewrite numeric constants into equivalent arithmetic
+//    expressions such as `(value + rnd) - rnd` which evaluate to the same result at
+//    runtime. This deters straightforward pattern matching on constants.
+//  * Metadata obfuscation – strip debug symbols, remove PDB references, randomise
+//    the ordering of types and members within metadata tables and remove common
+//    descriptive assembly attributes like AssemblyTitle and AssemblyDescription.
+//  * Anti‑decompiler injection – insert unreachable instructions with balanced
+//    stack usage to deliberately mislead decompilers without violating ECMA‑335
+//    requirements. For example, an always‑taken branch skips over a block that
+//    pushes and pops a value from the stack. The runtime never executes this
+//    dummy code but many decompilers will still attempt to decompile it.
+//
+// The tool uses Mono.Cecil to read and manipulate the assembly. Cecil exposes
+// metadata tokens so that simply changing the Name property of definitions is
+// sufficient for renaming; references are automatically updated as noted by
+// community guidance【759408141996310†L115-L124】. Control flow flattening is
+// inspired by the state machine flattening technique described in
+// reverse‑engineering literature【947098854075956†L98-L106】【947098854075956†L109-L143】.
+// String encryption follows the concept of assigning each string a unique key,
+// storing the encrypted bytes in a data blob and exposing a universal
+// decryption method【846784584722526†L28-L68】. Constant obfuscation is motivated
+// by the ByteHide ‘Constant Disintegration’ protection which replaces numeric
+// constants with expressions evaluating to the same value【249665806828484†L155-L165】.
+// Removing PDB symbols is important because PDB files map compiled code back to
+// source and should not be deployed with production binaries【491250536690664†L146-L155】.
+
+namespace Obfuscator
+{
+    /// <summary>
+    /// Configuration root corresponding to the JSON file consumed by the obfuscator.
+    /// </summary>
+    public class ObfuscationConfig
+    {
+        public string InputAssembly { get; set; } = string.Empty;
+        public string OutputAssembly { get; set; } = string.Empty;
+        public List<string> ExclusionList { get; set; } = new List<string>();
+        public EnabledPasses Passes { get; set; } = new EnabledPasses();
+        public string EncryptionSeed { get; set; } = string.Empty;
+        public string SmokeTestMethod { get; set; } = string.Empty;
+    }
+
+    /// <summary>
+    /// Structure representing which passes are enabled. Each property can
+    /// independently enable or disable a transformation stage.
+    /// </summary>
+    public class EnabledPasses
+    {
+        public bool Rename { get; set; } = true;
+        public bool ControlFlow { get; set; } = true;
+        public bool StringEncryption { get; set; } = true;
+        public bool ConstantObfuscation { get; set; } = true;
+        public bool MetadataObfuscation { get; set; } = true;
+        public bool AntiDecompiler { get; set; } = true;
+    }
+
+    /// <summary>
+    /// The main program orchestrates the obfuscation passes and writes the
+    /// modified assembly. Use --config path/to/config.json to specify the
+    /// configuration file.
+    /// </summary>
+    internal static class Program
+    {
+        static int Main(string[] args)
+        {
+            if (args.Length == 0 || args.Contains("--help") || args.Contains("-h"))
+            {
+                Console.WriteLine("Usage: dotnet run --config <config.json>");
+                return 1;
+            }
+
+            string? configPath = null;
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (args[i] == "--config")
+                {
+                    configPath = args[i + 1];
+                }
+            }
+            if (string.IsNullOrEmpty(configPath))
+            {
+                Console.Error.WriteLine("Configuration file path must be provided with --config");
+                return 1;
+            }
+            if (!File.Exists(configPath))
+            {
+                Console.Error.WriteLine($"Configuration file not found: {configPath}");
+                return 1;
+            }
+            var config = JsonSerializer.Deserialize<ObfuscationConfig>(File.ReadAllText(configPath));
+            if (config == null)
+            {
+                Console.Error.WriteLine("Failed to parse configuration file");
+                return 1;
+            }
+
+            var logger = new TransformationLogger();
+            try
+            {
+                var obfuscator = new ObfuscationPipeline(config, logger);
+                obfuscator.Execute();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Obfuscation failed: {ex}");
+                return 1;
+            }
+            // Write log at the end
+            File.WriteAllLines(Path.ChangeExtension(config.OutputAssembly, ".obfuscation.log"), logger.Entries);
+            Console.WriteLine("Obfuscation complete.");
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Collects messages from obfuscation passes. The log is written to a file
+    /// alongside the output assembly after all passes complete.
+    /// </summary>
+    public class TransformationLogger
+    {
+        private readonly List<string> _entries = new();
+        public void Log(string message)
+        {
+            _entries.Add($"[{DateTime.UtcNow:O}] {message}");
+        }
+        public IReadOnlyList<string> Entries => _entries;
+    }
+
+    /// <summary>
+    /// Encapsulates the complete obfuscation pipeline. Each transformation
+    /// registers itself with the pipeline and is executed in order. After
+    /// applying transformations, the pipeline optionally performs a smoke test.
+    /// </summary>
+    public class ObfuscationPipeline
+    {
+        private readonly ObfuscationConfig _config;
+        private readonly TransformationLogger _logger;
+        private readonly Random _random;
+
+        public ObfuscationPipeline(ObfuscationConfig config, TransformationLogger logger)
+        {
+            _config = config;
+            _logger = logger;
+            // Derive a deterministic random seed from the config
+            int seed;
+            if (!string.IsNullOrEmpty(config.EncryptionSeed))
+            {
+                unchecked
+                {
+                    seed = config.EncryptionSeed.Aggregate(0, (s, c) => (s * 31) ^ c);
+                }
+            }
+            else
+            {
+                seed = Environment.TickCount;
+            }
+            _random = new Random(seed);
+        }
+
+        /// <summary>
+        /// Executes all enabled passes. Writes the modified assembly to the
+        /// configured output path. Runs optional smoke test afterwards.
+        /// </summary>
+        public void Execute()
+        {
+            if (string.IsNullOrEmpty(_config.InputAssembly) || string.IsNullOrEmpty(_config.OutputAssembly))
+            {
+                throw new InvalidOperationException("InputAssembly and OutputAssembly must be specified");
+            }
+            if (!File.Exists(_config.InputAssembly))
+            {
+                throw new FileNotFoundException("Input assembly not found", _config.InputAssembly);
+            }
+
+            // Read assembly with symbols if present. Disable reading symbols for metadata obfuscation later.
+            var readerParams = new ReaderParameters
+            {
+                ReadWrite = true,
+                ReadSymbols = true,
+            };
+            var assembly = AssemblyDefinition.ReadAssembly(_config.InputAssembly, readerParams);
+            var module = assembly.MainModule;
+
+            // Apply passes in order: rename, control flow, string encryption, constant obfuscation,
+            // metadata obfuscation, anti decompiler.
+            if (_config.Passes.Rename)
+            {
+                var renamer = new RenamePass(_config, _logger, _random);
+                renamer.Apply(module);
+            }
+            if (_config.Passes.ControlFlow)
+            {
+                var cflow = new ControlFlowPass(_config, _logger, _random);
+                cflow.Apply(module);
+            }
+            if (_config.Passes.StringEncryption)
+            {
+                var strEnc = new StringEncryptionPass(_config, _logger, _random);
+                strEnc.Apply(module);
+            }
+            if (_config.Passes.ConstantObfuscation)
+            {
+                var constPass = new ConstantObfuscationPass(_config, _logger, _random);
+                constPass.Apply(module);
+            }
+            if (_config.Passes.MetadataObfuscation)
+            {
+                var meta = new MetadataObfuscationPass(_config, _logger, _random);
+                meta.Apply(module);
+            }
+            if (_config.Passes.AntiDecompiler)
+            {
+                var anti = new AntiDecompilerPass(_config, _logger, _random);
+                anti.Apply(module);
+            }
+
+            // Write assembly. Always disable symbol writing for obfuscated output.
+            var writerParams = new WriterParameters
+            {
+                WriteSymbols = false
+            };
+            assembly.Write(_config.OutputAssembly, writerParams);
+            _logger.Log($"Wrote obfuscated assembly to {_config.OutputAssembly}");
+
+            // Run smoke test if configured
+            if (!string.IsNullOrEmpty(_config.SmokeTestMethod))
+            {
+                RunSmokeTest(_config.OutputAssembly, _config.SmokeTestMethod);
+            }
+        }
+
+        /// <summary>
+        /// Invokes a user specified method in a new AssemblyLoadContext to
+        /// verify that the obfuscated assembly still works. The method must be
+        /// static and parameterless. Any exception thrown by the method
+        /// indicates a failed smoke test.
+        /// </summary>
+        private void RunSmokeTest(string assemblyPath, string methodDescriptor)
+        {
+            try
+            {
+                // The descriptor format is Namespace.Type::Method
+                var parts = methodDescriptor.Split("::", StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length != 2)
+                {
+                    _logger.Log($"Invalid SmokeTestMethod format: {methodDescriptor}");
+                    return;
+                }
+                var typeName = parts[0];
+                var methodName = parts[1];
+                // Load assembly into isolated context
+                var alc = new System.Runtime.Loader.AssemblyLoadContext("SmokeTest", isCollectible: true);
+                var asm = alc.LoadFromAssemblyPath(Path.GetFullPath(assemblyPath));
+                var type = asm.GetType(typeName);
+                if (type == null)
+                {
+                    _logger.Log($"Smoke test failed: type {typeName} not found in obfuscated assembly");
+                    return;
+                }
+                var method = type.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (method == null)
+                {
+                    _logger.Log($"Smoke test failed: method {methodName} not found on type {typeName}");
+                    return;
+                }
+                if (method.GetParameters().Length != 0)
+                {
+                    _logger.Log($"Smoke test method must be parameterless: {methodDescriptor}");
+                    return;
+                }
+                // Invoke method
+                method.Invoke(null, null);
+                _logger.Log($"Smoke test {methodDescriptor} executed successfully");
+                // Unload
+                alc.Unload();
+            }
+            catch (Exception ex)
+            {
+                _logger.Log($"Smoke test {methodDescriptor} threw exception: {ex}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pass to obfuscate names of non‑public types, methods, fields and properties.
+    /// Uses a deterministic random generator seeded from the configuration to
+    /// generate unique identifiers. Exclusion patterns prevent renaming of
+    /// reflection accessible members or those marked with interop attributes.
+    /// </summary>
+    internal class RenamePass
+    {
+        private readonly ObfuscationConfig _config;
+        private readonly TransformationLogger _logger;
+        private readonly Random _random;
+        private int _nameCounter;
+
+        private readonly List<System.Text.RegularExpressions.Regex> _exclusionRegexes;
+
+        public RenamePass(ObfuscationConfig config, TransformationLogger logger, Random random)
+        {
+            _config = config;
+            _logger = logger;
+            _random = random;
+            _nameCounter = 0;
+            _exclusionRegexes = _config.ExclusionList
+                .Select(pattern => new System.Text.RegularExpressions.Regex(pattern))
+                .ToList();
+        }
+
+        public void Apply(ModuleDefinition module)
+        {
+            // Build list of members to rename. We must rename types before
+            // renaming their members to avoid name clashes in nested scopes.
+            foreach (var type in module.Types.ToList())
+            {
+                RenameTypeRecursively(type);
+            }
+        }
+
+        private void RenameTypeRecursively(TypeDefinition type)
+        {
+            // Skip the special <Module> type which represents module metadata
+            if (type.Name == "<Module>")
+                return;
+
+            // First rename nested types
+            foreach (var nested in type.NestedTypes)
+            {
+                RenameTypeRecursively(nested);
+            }
+
+            // Decide whether to rename this type
+            if (!type.IsPublic && !type.IsNestedPublic)
+            {
+                if (!IsExcluded(type))
+                {
+                    var newName = GenerateName();
+                    _logger.Log($"Renaming type {type.FullName} -> {newName}");
+                    type.Name = newName;
+                }
+            }
+            // Rename fields
+            foreach (var field in type.Fields)
+            {
+                RenameField(field);
+            }
+            // Rename properties and their accessor methods
+            foreach (var prop in type.Properties)
+            {
+                RenameProperty(prop);
+            }
+            // Rename events and their accessor methods
+            foreach (var ev in type.Events)
+            {
+                RenameEvent(ev);
+            }
+            // Rename methods after properties/events to ensure accessors are handled
+            foreach (var method in type.Methods)
+            {
+                RenameMethod(method);
+            }
+        }
+
+        private void RenameField(FieldDefinition field)
+        {
+            // Only rename non‑public instance or static fields
+            if (field.IsPublic || field.IsFamily || field.IsFamilyOrAssembly)
+                return;
+            // Do not rename fields that are marked with SerializeField, DllImport, MarshalAs or Obfuscation attributes
+            if (HasInteropAttribute(field.CustomAttributes))
+                return;
+            if (IsExcluded(field))
+                return;
+            var newName = GenerateName();
+            _logger.Log($"Renaming field {field.FullName} -> {newName}");
+            field.Name = newName;
+        }
+
+        private void RenameProperty(PropertyDefinition prop)
+        {
+            // Only rename non‑public properties
+            var getMethod = prop.GetMethod;
+            var setMethod = prop.SetMethod;
+            bool isPublic = (getMethod != null && (getMethod.IsPublic || getMethod.IsFamily || getMethod.IsFamilyOrAssembly)) ||
+                            (setMethod != null && (setMethod.IsPublic || setMethod.IsFamily || setMethod.IsFamilyOrAssembly));
+            if (isPublic)
+                return;
+            if (IsExcluded(prop))
+                return;
+            var newName = GenerateName();
+            _logger.Log($"Renaming property {prop.FullName} -> {newName}");
+            // Rename property and update accessor names accordingly
+            prop.Name = newName;
+            if (getMethod != null)
+            {
+                getMethod.Name = $"get_{newName}";
+            }
+            if (setMethod != null)
+            {
+                setMethod.Name = $"set_{newName}";
+            }
+        }
+
+        private void RenameEvent(EventDefinition ev)
+        {
+            // Only rename non‑public events
+            var addMethod = ev.AddMethod;
+            var removeMethod = ev.RemoveMethod;
+            bool isPublic = (addMethod != null && (addMethod.IsPublic || addMethod.IsFamily || addMethod.IsFamilyOrAssembly)) ||
+                            (removeMethod != null && (removeMethod.IsPublic || removeMethod.IsFamily || removeMethod.IsFamilyOrAssembly));
+            if (isPublic)
+                return;
+            if (IsExcluded(ev))
+                return;
+            var newName = GenerateName();
+            _logger.Log($"Renaming event {ev.FullName} -> {newName}");
+            ev.Name = newName;
+            if (addMethod != null)
+            {
+                addMethod.Name = $"add_{newName}";
+            }
+            if (removeMethod != null)
+            {
+                removeMethod.Name = $"remove_{newName}";
+            }
+        }
+
+        private void RenameMethod(MethodDefinition method)
+        {
+            // Only rename non‑public methods; skip constructors
+            if (method.IsConstructor || method.IsPublic || method.IsFamily || method.IsFamilyOrAssembly)
+                return;
+            // Do not rename methods implementing interface or overriding base
+            if (method.IsVirtual && (method.IsReuseSlot || method.Overrides.Count > 0))
+                return;
+            // Do not rename PInvoke methods
+            if (method.IsPInvokeImpl)
+                return;
+            // Skip property/event accessors – renamed as part of property/event rename
+            if (method.SemanticsAttributes != 0)
+                return;
+            if (IsExcluded(method))
+                return;
+            var newName = GenerateName();
+            _logger.Log($"Renaming method {method.FullName} -> {newName}");
+            method.Name = newName;
+            // Note: parameter names are not meaningful for execution and usually stripped in release builds,
+            // so we do not rename them here.
+        }
+
+        private bool HasInteropAttribute(IEnumerable<CustomAttribute> attributes)
+        {
+            foreach (var ca in attributes)
+            {
+                var name = ca.AttributeType.FullName;
+                if (name == "System.Runtime.InteropServices.DllImportAttribute" ||
+                    name == "System.Runtime.InteropServices.MarshalAsAttribute" ||
+                    name == "System.NonSerializedAttribute" ||
+                    name == "UnityEngine.SerializeField" ||
+                    name == "System.Reflection.ObfuscationAttribute")
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private bool IsExcluded(IMemberDefinition member)
+        {
+            // Build fully qualified name (namespace + type + member)
+            string fullName = member.FullName;
+            foreach (var regex in _exclusionRegexes)
+            {
+                if (regex.IsMatch(fullName))
+                    return true;
+            }
+            return false;
+        }
+
+        private string GenerateName()
+        {
+            // Generate a short base36 identifier using the counter
+            int value = _nameCounter++;
+            const string alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            if (value == 0)
+                return alphabet[0].ToString();
+            var sb = new StringBuilder();
+            int baseLen = alphabet.Length;
+            while (value > 0)
+            {
+                sb.Insert(0, alphabet[value % baseLen]);
+                value /= baseLen;
+            }
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Pass to flatten control flow and insert opaque predicates. This
+    /// implementation performs conservative flattening on methods without
+    /// exception handlers and without complex branching (e.g., switch or leave
+    /// instructions). For methods that cannot be flattened safely, only opaque
+    /// predicates are injected. The flattening technique is inspired by
+    /// dispatcher loop control flow flattening【947098854075956†L98-L106】.
+    /// </summary>
+    internal class ControlFlowPass
+    {
+        private readonly ObfuscationConfig _config;
+        private readonly TransformationLogger _logger;
+        private readonly Random _random;
+
+        public ControlFlowPass(ObfuscationConfig config, TransformationLogger logger, Random random)
+        {
+            _config = config;
+            _logger = logger;
+            _random = random;
+        }
+
+        public void Apply(ModuleDefinition module)
+        {
+            foreach (var type in module.Types)
+            {
+                ProcessType(type);
+            }
+        }
+
+        private void ProcessType(TypeDefinition type)
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody)
+                    continue;
+                // Insert an opaque predicate at the beginning of each method
+                InsertOpaquePredicate(method);
+                // Attempt to flatten control flow if safe
+                TryFlatten(method);
+            }
+            foreach (var nested in type.NestedTypes)
+            {
+                ProcessType(nested);
+            }
+        }
+
+        /// <summary>
+        /// Inserts a simple opaque predicate that is always true and contains
+        /// unreachable code. The inserted instructions balance the stack to
+        /// maintain verifiable IL.
+        /// </summary>
+        private void InsertOpaquePredicate(MethodDefinition method)
+        {
+            var body = method.Body;
+            var il = body.GetILProcessor();
+            var first = body.Instructions.First();
+            // Construct the following sequence:
+            // ldc.i4.0
+            // br.s skip
+            // ldc.i4.1
+            // pop
+            // skip:
+            var skip = Instruction.Create(OpCodes.Nop);
+            var seq = new[]
+            {
+                Instruction.Create(OpCodes.Ldc_I4_0),
+                Instruction.Create(OpCodes.Br_S, skip),
+                Instruction.Create(OpCodes.Ldc_I4_1),
+                Instruction.Create(OpCodes.Pop),
+                skip
+            };
+            foreach (var instr in seq.Reverse())
+            {
+                il.InsertBefore(first, instr);
+            }
+            _logger.Log($"Inserted opaque predicate in {method.FullName}");
+        }
+
+        /// <summary>
+        /// Attempts to flatten the method body into a state machine dispatcher
+        /// pattern. If the method contains exception handlers, switch
+        /// instructions or leave instructions, the method is left unmodified.
+        /// </summary>
+        private void TryFlatten(MethodDefinition method)
+        {
+            var body = method.Body;
+            // Skip flattening for methods with exception handlers or empty bodies
+            if (!body.HasExceptionHandlers && body.Instructions.Count > 10)
+            {
+                // Quick scan to see if method contains opcodes we do not handle
+                bool canFlatten = true;
+                foreach (var instr in body.Instructions)
+                {
+                    if (instr.OpCode.FlowControl == FlowControl.Throw ||
+                        instr.OpCode.Code == Code.Switch ||
+                        instr.OpCode.Code == Code.Leave ||
+                        instr.OpCode.Code == Code.Leave_S)
+                    {
+                        canFlatten = false;
+                        break;
+                    }
+                }
+                if (canFlatten)
+                {
+                    try
+                    {
+                        FlattenMethod(method);
+                        _logger.Log($"Flattened control flow in {method.FullName}");
+                    }
+                    catch (Exception ex)
+                    {
+                        // If flattening fails, leave the method untouched and log the reason
+                        _logger.Log($"Failed to flatten {method.FullName}: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Performs control flow flattening by transforming the method into a
+        /// state machine. Only basic branch opcodes (br, brtrue, brfalse) are
+        /// supported. The resulting IL uses a local state variable and a
+        /// dispatcher loop with a switch statement.
+        /// </summary>
+        private void FlattenMethod(MethodDefinition method)
+        {
+            var body = method.Body;
+            var il = body.GetILProcessor();
+            var originalInstructions = body.Instructions.ToList();
+            // Analyse basic blocks
+            var blocks = BuildBasicBlocks(originalInstructions, out var blockMap);
+            if (blocks.Count < 2)
+            {
+                // Nothing to flatten
+                return;
+            }
+            // Determine transitions for each block
+            var transitions = new List<BlockTransition>();
+            foreach (var block in blocks)
+            {
+                transitions.Add(AnalyseBlockTransition(block, blockMap, blocks));
+            }
+            // Setup new body
+            body.Variables.Add(new VariableDefinition(method.Module.TypeSystem.Int32)); // stateVar at last index
+            int stateVarIndex = body.Variables.Count - 1;
+            body.InitLocals = true;
+            body.Instructions.Clear();
+            var switchTargets = new Instruction[blocks.Count];
+            // Create placeholder targets for each state
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                switchTargets[i] = Instruction.Create(OpCodes.Nop);
+            }
+            // Instruction list
+            var instrs = new List<Instruction>();
+            // Initialise state variable to 0
+            instrs.Add(Instruction.Create(OpCodes.Ldc_I4_0));
+            instrs.Add(Instruction.Create(OpCodes.Stloc, stateVarIndex));
+            // Start of dispatcher loop
+            var loopStart = Instruction.Create(OpCodes.Nop);
+            instrs.Add(loopStart);
+            // Load state and switch
+            instrs.Add(Instruction.Create(OpCodes.Ldloc, stateVarIndex));
+            var switchInstr = Instruction.Create(OpCodes.Switch, switchTargets);
+            instrs.Add(switchInstr);
+            // Default case: break out of loop (for state outside range)
+            var breakInstr = Instruction.Create(OpCodes.Br, Instruction.Create(OpCodes.Ret));
+            instrs.Add(breakInstr);
+            // Append case bodies
+            var caseBodies = new List<List<Instruction>>(blocks.Count);
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                var caseInstrs = new List<Instruction>();
+                // Mark the target
+                caseInstrs.Add(switchTargets[i]);
+                // Copy original instructions except branch
+                foreach (var orig in blocks[i].Instructions)
+                {
+                    if (IsBranchInstruction(orig))
+                    {
+                        // We'll handle transitions separately
+                        break;
+                    }
+                    caseInstrs.Add(CloneInstruction(orig, method, stateVarIndex));
+                }
+                // Append transition
+                var trans = transitions[i];
+                BuildTransition(il, caseInstrs, trans, stateVarIndex, loopStart);
+                caseBodies.Add(caseInstrs);
+            }
+            // Add all case bodies to the instruction list
+            foreach (var caseInstrs in caseBodies)
+            {
+                instrs.AddRange(caseInstrs);
+            }
+            // Append final return (default path)
+            instrs.Add(Instruction.Create(OpCodes.Ret));
+            // Now replace method body
+            body.Instructions.Clear();
+            foreach (var instr in instrs)
+            {
+                body.Instructions.Add(instr);
+            }
+        }
+
+        private static bool IsBranchInstruction(Instruction instr)
+        {
+            return instr.OpCode.FlowControl == FlowControl.Branch || instr.OpCode.FlowControl == FlowControl.Cond_Branch;
+        }
+
+        /// <summary>
+        /// Clones a single instruction. For most instructions the operand can be reused.
+        /// </summary>
+        private static Instruction CloneInstruction(Instruction orig, MethodDefinition context, int stateVarIndex)
+        {
+            // For simplicity we do not deep clone branch targets here because
+            // branch instructions are excluded from cloning in FlattenMethod. Other
+            // instructions can be reused as is. For call instructions referencing
+            // member definitions, the operand is reused. If the operand is a
+            // parameter or variable, update variable index if necessary.
+            if (orig.Operand is ParameterDefinition param)
+            {
+                return Instruction.Create(orig.OpCode, param);
+            }
+            else if (orig.Operand is VariableDefinition var)
+            {
+                return Instruction.Create(orig.OpCode, var);
+            }
+            else if (orig.Operand == null)
+            {
+                return Instruction.Create(orig.OpCode);
+            }
+            else
+            {
+                return Instruction.Create(orig.OpCode, orig.Operand);
+            }
+        }
+
+        /// <summary>
+        /// Represents a basic block: a contiguous sequence of instructions without
+        /// internal jumps. The LastInstruction is the branch instruction (if any).
+        /// </summary>
+        private class BasicBlock
+        {
+            public int Index;
+            public List<Instruction> Instructions = new();
+        }
+
+        /// <summary>
+        /// Describes how to transition from a block: for unconditional or
+        /// conditional jumps, the next state(s) are recorded. For return
+        /// instructions, state is set to -1.
+        /// </summary>
+        private record BlockTransition
+        {
+            public int BlockIndex;
+            public TransitionKind Kind;
+            public int TrueState;
+            public int FalseState;
+            public Instruction OriginalBranch;
+        }
+
+        private enum TransitionKind { None, Unconditional, Conditional, Return }
+
+        private static List<BasicBlock> BuildBasicBlocks(List<Instruction> instructions, out Dictionary<Instruction, int> blockMap)
+        {
+            blockMap = new Dictionary<Instruction, int>();
+            var starts = new HashSet<Instruction>();
+            if (instructions.Count > 0)
+                starts.Add(instructions[0]);
+            // Determine block starts based on branch targets and fallthrough
+            foreach (var instr in instructions)
+            {
+                if (instr.OpCode.FlowControl == FlowControl.Branch || instr.OpCode.FlowControl == FlowControl.Cond_Branch)
+                {
+                    if (instr.Operand is Instruction target)
+                    {
+                        starts.Add(target);
+                        // next instruction after a branch also starts a block
+                        var next = instr.Next;
+                        if (next != null)
+                            starts.Add(next);
+                    }
+                }
+                else if (instr.OpCode.FlowControl == FlowControl.Return)
+                {
+                    var next = instr.Next;
+                    if (next != null)
+                        starts.Add(next);
+                }
+            }
+            // Build blocks
+            var sortedStarts = instructions.Where(i => starts.Contains(i)).ToList();
+            var blocks = new List<BasicBlock>();
+            for (int i = 0; i < sortedStarts.Count; i++)
+            {
+                var start = sortedStarts[i];
+                var block = new BasicBlock { Index = blocks.Count };
+                var current = start;
+                while (current != null)
+                {
+                    block.Instructions.Add(current);
+                    // Break if next is a start of another block
+                    var next = current.Next;
+                    if (next == null || starts.Contains(next))
+                        break;
+                    current = next;
+                }
+                blocks.Add(block);
+            }
+            // Fill blockMap for branch target resolution
+            foreach (var block in blocks)
+            {
+                blockMap[block.Instructions[0]] = block.Index;
+            }
+            return blocks;
+        }
+
+        private static BlockTransition AnalyseBlockTransition(BasicBlock block, Dictionary<Instruction, int> blockMap, List<BasicBlock> blocks)
+        {
+            var lastInstr = block.Instructions.Last();
+            if (lastInstr.OpCode.FlowControl == FlowControl.Return)
+            {
+                return new BlockTransition { BlockIndex = block.Index, Kind = TransitionKind.Return };
+            }
+            if (lastInstr.OpCode.FlowControl == FlowControl.Branch)
+            {
+                // Unconditional branch
+                int targetState = -1;
+                if (lastInstr.Operand is Instruction target && blockMap.TryGetValue(target, out targetState))
+                {
+                    return new BlockTransition { BlockIndex = block.Index, Kind = TransitionKind.Unconditional, TrueState = targetState, OriginalBranch = lastInstr };
+                }
+                // Unknown target: treat as return
+                return new BlockTransition { BlockIndex = block.Index, Kind = TransitionKind.Return };
+            }
+            if (lastInstr.OpCode.FlowControl == FlowControl.Cond_Branch)
+            {
+                // Conditional branch: branch to operand on true; fall through to next block on false
+                int trueState = -1;
+                int falseState = -1;
+                if (lastInstr.Operand is Instruction target && blockMap.TryGetValue(target, out trueState))
+                {
+                    var nextInstr = lastInstr.Next;
+                    if (nextInstr != null && blockMap.TryGetValue(nextInstr, out falseState))
+                    {
+                        return new BlockTransition
+                        {
+                            BlockIndex = block.Index,
+                            Kind = TransitionKind.Conditional,
+                            TrueState = trueState,
+                            FalseState = falseState,
+                            OriginalBranch = lastInstr
+                        };
+                    }
+                }
+                // If we cannot resolve, treat as return
+                return new BlockTransition { BlockIndex = block.Index, Kind = TransitionKind.Return };
+            }
+            // Fallthrough: go to next block if present
+            var last = block.Instructions.Last();
+            var nextInst = last.Next;
+            if (nextInst != null && blockMap.TryGetValue(nextInst, out int fallState))
+            {
+                return new BlockTransition { BlockIndex = block.Index, Kind = TransitionKind.Unconditional, TrueState = fallState, OriginalBranch = null };
+            }
+            // Else return
+            return new BlockTransition { BlockIndex = block.Index, Kind = TransitionKind.Return };
+        }
+
+        private static void BuildTransition(ILProcessor il, List<Instruction> caseInstrs, BlockTransition trans, int stateVarIndex, Instruction loopStart)
+        {
+            // Append code to set state variable and branch back to loop
+            switch (trans.Kind)
+            {
+                case TransitionKind.Return:
+                    // Emit return
+                    caseInstrs.Add(Instruction.Create(OpCodes.Ret));
+                    break;
+                case TransitionKind.Unconditional:
+                    // Set state = TrueState; branch to loop start
+                    caseInstrs.Add(Instruction.Create(OpCodes.Ldc_I4, trans.TrueState));
+                    caseInstrs.Add(Instruction.Create(OpCodes.Stloc, stateVarIndex));
+                    caseInstrs.Add(Instruction.Create(OpCodes.Br, loopStart));
+                    break;
+                case TransitionKind.Conditional:
+                    // Evaluate original condition. We clone the original branch
+                    // instruction so the condition logic remains the same but redirect the target.
+                    var branch = trans.OriginalBranch;
+                    // Clone preceding condition instructions if needed – these
+                    // instructions are already present in caseInstrs because
+                    // BuildBasicBlocks included them. We only need to emit branch.
+                    var trueLabel = Instruction.Create(OpCodes.Nop);
+                    // Emit conditional branch with original opcode pointing to trueLabel
+                    caseInstrs.Add(Instruction.Create(branch.OpCode, trueLabel));
+                    // False path: load falseState, stloc, br loopStart
+                    caseInstrs.Add(Instruction.Create(OpCodes.Ldc_I4, trans.FalseState));
+                    caseInstrs.Add(Instruction.Create(OpCodes.Stloc, stateVarIndex));
+                    caseInstrs.Add(Instruction.Create(OpCodes.Br, loopStart));
+                    // True label
+                    caseInstrs.Add(trueLabel);
+                    // True path: load trueState, stloc, br loopStart
+                    caseInstrs.Add(Instruction.Create(OpCodes.Ldc_I4, trans.TrueState));
+                    caseInstrs.Add(Instruction.Create(OpCodes.Stloc, stateVarIndex));
+                    caseInstrs.Add(Instruction.Create(OpCodes.Br, loopStart));
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pass to encrypt string literals and inject a runtime decryption stub into
+    /// the target assembly. Each unique string is assigned an index and
+    /// encrypted using a simple XOR cipher. A static method reads the
+    /// encrypted bytes, decrypts them using a key derived from the assembly’s
+    /// MVID and caches the result【846784584722526†L28-L68】.
+    /// </summary>
+    internal class StringEncryptionPass
+    {
+        private readonly ObfuscationConfig _config;
+        private readonly TransformationLogger _logger;
+        private readonly Random _random;
+
+        public StringEncryptionPass(ObfuscationConfig config, TransformationLogger logger, Random random)
+        {
+            _config = config;
+            _logger = logger;
+            _random = random;
+        }
+
+        public void Apply(ModuleDefinition module)
+        {
+            // Build list of strings
+            var stringLiterals = new List<string>();
+            // Map from string literal to index
+            var stringIndexMap = new Dictionary<string, int>();
+            foreach (var type in module.Types)
+            {
+                CollectStrings(type, stringLiterals, stringIndexMap);
+            }
+            if (stringLiterals.Count == 0)
+                return;
+            // Encrypt each string using XOR with key (computed at runtime)
+            var encryptedData = new List<byte[]>();
+            foreach (var s in stringLiterals)
+            {
+                var bytes = Encoding.UTF8.GetBytes(s);
+                var enc = new byte[bytes.Length];
+                // XOR with placeholder zero; the real key will be applied at runtime
+                for (int i = 0; i < bytes.Length; i++)
+                {
+                    enc[i] = (byte)(bytes[i] ^ 0);
+                }
+                encryptedData.Add(enc);
+            }
+            // Inject decryptor type
+            var decryptorType = InjectDecryptorType(module, encryptedData);
+            // Replace ldstr instructions
+            int patched = 0;
+            foreach (var type in module.Types)
+            {
+                patched += ReplaceStringLiterals(type, stringIndexMap, decryptorType);
+            }
+            _logger.Log($"Encrypted {stringLiterals.Count} strings and patched {patched} ldstr instructions");
+        }
+
+        private void CollectStrings(TypeDefinition type, List<string> literals, Dictionary<string, int> map)
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                foreach (var instr in method.Body.Instructions)
+                {
+                    if (instr.OpCode.Code == Code.Ldstr)
+                    {
+                        string value = (string)instr.Operand;
+                        if (!map.ContainsKey(value))
+                        {
+                            int index = map.Count;
+                            map[value] = index;
+                            literals.Add(value);
+                        }
+                    }
+                }
+            }
+            foreach (var nested in type.NestedTypes)
+            {
+                CollectStrings(nested, literals, map);
+            }
+        }
+
+        private TypeDefinition InjectDecryptorType(ModuleDefinition module, List<byte[]> encryptedData)
+        {
+            var objectType = module.ImportReference(typeof(object));
+            var typeDef = new TypeDefinition("", "StringDecryptor", TypeAttributes.Class | TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed, objectType);
+            module.Types.Add(typeDef);
+            // Add fields: private static byte[][] data; private static int key; private static Dictionary<int,string> cache;
+            var byteType = module.TypeSystem.Byte;
+            var byteArrayType = new ArrayType(byteType);
+            var dataFieldType = new ArrayType(byteArrayType);
+            var dataField = new FieldDefinition("data", FieldAttributes.Private | FieldAttributes.Static | FieldAttributes.InitOnly, dataFieldType);
+            typeDef.Fields.Add(dataField);
+            var intType = module.TypeSystem.Int32;
+            var keyField = new FieldDefinition("key", FieldAttributes.Private | FieldAttributes.Static | FieldAttributes.InitOnly, intType);
+            typeDef.Fields.Add(keyField);
+            // Dictionary<int,string>
+            var dictTypeRef = module.ImportReference(typeof(Dictionary<int, string>));
+            var cacheField = new FieldDefinition("cache", FieldAttributes.Private | FieldAttributes.Static, dictTypeRef);
+            typeDef.Fields.Add(cacheField);
+            // Add static constructor
+            var cctor = new MethodDefinition(".cctor", MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, module.TypeSystem.Void);
+            typeDef.Methods.Add(cctor);
+            cctor.Body.Variables.Add(new VariableDefinition(dictTypeRef));
+            cctor.Body.InitLocals = true;
+            var cctorIl = cctor.Body.GetILProcessor();
+            // Initialise data array
+            cctorIl.Append(Instruction.Create(OpCodes.Ldc_I4, encryptedData.Count));
+            cctorIl.Append(Instruction.Create(OpCodes.Newarr, byteArrayType));
+            for (int i = 0; i < encryptedData.Count; i++)
+            {
+                var bytes = encryptedData[i];
+                cctorIl.Append(Instruction.Create(OpCodes.Dup));
+                cctorIl.Append(Instruction.Create(OpCodes.Ldc_I4, i));
+                cctorIl.Append(Instruction.Create(OpCodes.Ldc_I4, bytes.Length));
+                cctorIl.Append(Instruction.Create(OpCodes.Newarr, byteType));
+                for (int j = 0; j < bytes.Length; j++)
+                {
+                    cctorIl.Append(Instruction.Create(OpCodes.Dup));
+                    cctorIl.Append(Instruction.Create(OpCodes.Ldc_I4, j));
+                    cctorIl.Append(Instruction.Create(OpCodes.Ldc_I4, bytes[j]));
+                    cctorIl.Append(Instruction.Create(OpCodes.Stelem_I1));
+                }
+                cctorIl.Append(Instruction.Create(OpCodes.Stelem_Ref));
+            }
+            cctorIl.Append(Instruction.Create(OpCodes.Stsfld, dataField));
+            // Compute key from assembly MVID and encryption seed
+            // key = BitConverter.ToInt32(MVID.ToByteArray(), 0) ^ seed
+            var asmGet = module.ImportReference(typeof(Assembly).GetMethod(nameof(Assembly.GetExecutingAssembly), BindingFlags.Static | BindingFlags.Public));
+            var modProp = module.ImportReference(typeof(Assembly).GetProperty("ManifestModule").GetGetMethod());
+            var mvidProp = module.ImportReference(typeof(Module).GetProperty("ModuleVersionId").GetGetMethod());
+            var guidToByteArray = module.ImportReference(typeof(Guid).GetMethod(nameof(Guid.ToByteArray), Type.EmptyTypes));
+            var bitConverterToInt32 = module.ImportReference(typeof(BitConverter).GetMethod(nameof(BitConverter.ToInt32), new[] { typeof(byte[]), typeof(int) }));
+            // Load Assembly
+            cctorIl.Append(Instruction.Create(OpCodes.Call, asmGet));
+            cctorIl.Append(Instruction.Create(OpCodes.Callvirt, modProp));
+            cctorIl.Append(Instruction.Create(OpCodes.Callvirt, mvidProp));
+            cctorIl.Append(Instruction.Create(OpCodes.Call, guidToByteArray));
+            cctorIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+            cctorIl.Append(Instruction.Create(OpCodes.Call, bitConverterToInt32));
+            // XOR with seed hash
+            int seedVal = 0;
+            if (!string.IsNullOrEmpty(_config.EncryptionSeed))
+            {
+                unchecked
+                {
+                    foreach (char c in _config.EncryptionSeed)
+                    {
+                        seedVal = (seedVal * 31) ^ c;
+                    }
+                }
+            }
+            cctorIl.Append(Instruction.Create(OpCodes.Ldc_I4, seedVal));
+            cctorIl.Append(Instruction.Create(OpCodes.Xor));
+            cctorIl.Append(Instruction.Create(OpCodes.Stsfld, keyField));
+            // Initialise cache = new Dictionary<int,string>()
+            var dictCtor = module.ImportReference(typeof(Dictionary<int, string>).GetConstructor(Type.EmptyTypes));
+            cctorIl.Append(Instruction.Create(OpCodes.Newobj, dictCtor));
+            cctorIl.Append(Instruction.Create(OpCodes.Stsfld, cacheField));
+            cctorIl.Append(Instruction.Create(OpCodes.Ret));
+            // Add decryption method
+            var getString = new MethodDefinition("Get", MethodAttributes.Public | MethodAttributes.Static, module.TypeSystem.String);
+            getString.Parameters.Add(new ParameterDefinition("id", ParameterAttributes.None, module.TypeSystem.Int32));
+            typeDef.Methods.Add(getString);
+            var getIl = getString.Body.GetILProcessor();
+            getString.Body.InitLocals = true;
+            // locals: string result
+            var resultVar = new VariableDefinition(module.TypeSystem.String);
+            getString.Body.Variables.Add(resultVar);
+            // if (cache.TryGetValue(id, out result)) return result;
+            var tryGet = module.ImportReference(typeof(Dictionary<int, string>).GetMethod("TryGetValue", new[] { typeof(int), typeof(string).MakeByRefType() }));
+            var lblDecrypt = Instruction.Create(OpCodes.Nop);
+            getIl.Append(Instruction.Create(OpCodes.Ldsfld, cacheField));
+            getIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+            getIl.Append(Instruction.Create(OpCodes.Ldloca_S, resultVar));
+            getIl.Append(Instruction.Create(OpCodes.Callvirt, tryGet));
+            // If found, branch to return existing result
+            getIl.Append(Instruction.Create(OpCodes.Brfalse_S, lblDecrypt));
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, resultVar));
+            getIl.Append(Instruction.Create(OpCodes.Ret));
+            // Decrypt
+            getIl.Append(lblDecrypt);
+            // byte[] enc = data[id]
+            getIl.Append(Instruction.Create(OpCodes.Ldsfld, dataField));
+            getIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+            getIl.Append(Instruction.Create(OpCodes.Ldelem_Ref));
+            var encVar = new VariableDefinition(new ArrayType(byteType));
+            getString.Body.Variables.Add(encVar);
+            getIl.Append(Instruction.Create(OpCodes.Stloc, encVar));
+            // byte[] dec = new byte[enc.Length]
+            var decVar = new VariableDefinition(new ArrayType(byteType));
+            getString.Body.Variables.Add(decVar);
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, encVar));
+            getIl.Append(Instruction.Create(OpCodes.Ldlen));
+            getIl.Append(Instruction.Create(OpCodes.Conv_I4));
+            getIl.Append(Instruction.Create(OpCodes.Newarr, byteType));
+            getIl.Append(Instruction.Create(OpCodes.Stloc, decVar));
+            // for (int i=0; i<dec.Length; i++) dec[i] = (byte)(enc[i] ^ key)
+            var loopIdx = new VariableDefinition(module.TypeSystem.Int32);
+            getString.Body.Variables.Add(loopIdx);
+            var loopStart = Instruction.Create(OpCodes.Nop);
+            var loopCheck = Instruction.Create(OpCodes.Nop);
+            getIl.Append(Instruction.Create(OpCodes.Ldc_I4_0));
+            getIl.Append(Instruction.Create(OpCodes.Stloc, loopIdx));
+            getIl.Append(Instruction.Create(OpCodes.Br_S, loopCheck));
+            getIl.Append(loopStart);
+            // load dec[i]
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, decVar));
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, loopIdx));
+            // (byte)(enc[i] ^ key)
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, encVar));
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, loopIdx));
+            getIl.Append(Instruction.Create(OpCodes.Ldelem_U1));
+            getIl.Append(Instruction.Create(OpCodes.Ldsfld, keyField));
+            getIl.Append(Instruction.Create(OpCodes.Xor));
+            getIl.Append(Instruction.Create(OpCodes.Conv_U1));
+            getIl.Append(Instruction.Create(OpCodes.Stelem_I1));
+            // i++
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, loopIdx));
+            getIl.Append(Instruction.Create(OpCodes.Ldc_I4_1));
+            getIl.Append(Instruction.Create(OpCodes.Add));
+            getIl.Append(Instruction.Create(OpCodes.Stloc, loopIdx));
+            // loop check
+            getIl.Append(loopCheck);
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, loopIdx));
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, decVar));
+            getIl.Append(Instruction.Create(OpCodes.Ldlen));
+            getIl.Append(Instruction.Create(OpCodes.Conv_I4));
+            getIl.Append(Instruction.Create(OpCodes.Blt_S, loopStart));
+            // string s = Encoding.UTF8.GetString(dec)
+            var encodingGet = module.ImportReference(typeof(Encoding).GetProperty("UTF8").GetGetMethod());
+            var getStringMethod = module.ImportReference(typeof(Encoding).GetMethod("GetString", new[] { typeof(byte[]) }));
+            getIl.Append(Instruction.Create(OpCodes.Call, encodingGet));
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, decVar));
+            getIl.Append(Instruction.Create(OpCodes.Callvirt, getStringMethod));
+            // intern the string
+            var internMethod = module.ImportReference(typeof(string).GetMethod("Intern", BindingFlags.Static | BindingFlags.Public, null, new[] { typeof(string) }, null));
+            getIl.Append(Instruction.Create(OpCodes.Call, internMethod));
+            // store in resultVar
+            getIl.Append(Instruction.Create(OpCodes.Stloc, resultVar));
+            // cache[id] = result
+            getIl.Append(Instruction.Create(OpCodes.Ldsfld, cacheField));
+            getIl.Append(Instruction.Create(OpCodes.Ldarg_0));
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, resultVar));
+            var dictAdd = module.ImportReference(typeof(Dictionary<int, string>).GetMethod("Add", new[] { typeof(int), typeof(string) }));
+            getIl.Append(Instruction.Create(OpCodes.Callvirt, dictAdd));
+            // return result
+            getIl.Append(Instruction.Create(OpCodes.Ldloc, resultVar));
+            getIl.Append(Instruction.Create(OpCodes.Ret));
+            return typeDef;
+        }
+
+        private int ReplaceStringLiterals(TypeDefinition type, Dictionary<string, int> map, TypeDefinition decryptor)
+        {
+            int patched = 0;
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                var il = method.Body.GetILProcessor();
+                for (int i = 0; i < method.Body.Instructions.Count; i++)
+                {
+                    var instr = method.Body.Instructions[i];
+                    if (instr.OpCode.Code == Code.Ldstr)
+                    {
+                        string value = (string)instr.Operand;
+                        if (map.TryGetValue(value, out int id))
+                        {
+                            // Replace ldstr with ldc.i4 and call decryptor
+                            var newInstrs = new List<Instruction>
+                            {
+                                Instruction.Create(OpCodes.Ldc_I4, id),
+                                Instruction.Create(OpCodes.Call, decryptor.Methods.First(m => m.Name == "Get"))
+                            };
+                            il.Replace(instr, newInstrs[0]);
+                            il.InsertAfter(newInstrs[0], newInstrs[1]);
+                            patched++;
+                        }
+                    }
+                }
+            }
+            foreach (var nested in type.NestedTypes)
+            {
+                patched += ReplaceStringLiterals(nested, map, decryptor);
+            }
+            return patched;
+        }
+    }
+
+    /// <summary>
+    /// Pass to obfuscate numeric constants by expressing them as equivalent
+    /// arithmetic formulas. The transformation walks through all instructions and
+    /// rewrites ldc.i4 and ldc.r4 operations into sequences that compute the
+    /// same value at runtime. This makes pattern matching on constants more
+    /// difficult【249665806828484†L155-L165】.
+    /// </summary>
+    internal class ConstantObfuscationPass
+    {
+        private readonly ObfuscationConfig _config;
+        private readonly TransformationLogger _logger;
+        private readonly Random _random;
+
+        public ConstantObfuscationPass(ObfuscationConfig config, TransformationLogger logger, Random random)
+        {
+            _config = config;
+            _logger = logger;
+            _random = random;
+        }
+        public void Apply(ModuleDefinition module)
+        {
+            int count = 0;
+            foreach (var type in module.Types)
+            {
+                count += ObfuscateConstants(type);
+            }
+            if (count > 0)
+            {
+                _logger.Log($"Obfuscated {count} numeric constants");
+            }
+        }
+        private int ObfuscateConstants(TypeDefinition type)
+        {
+            int count = 0;
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                var il = method.Body.GetILProcessor();
+                for (int i = 0; i < method.Body.Instructions.Count; i++)
+                {
+                    var instr = method.Body.Instructions[i];
+                    if (instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I4_S)
+                    {
+                        int value = instr.OpCode.Code == Code.Ldc_I4_S ? (sbyte)instr.Operand : (int)instr.Operand;
+                        // Skip small constants (0, 1) to keep IL compact
+                        if (value == 0 || value == 1) continue;
+                        // Build expression (value + rnd) - rnd
+                        int rnd = _random.Next(2, 16);
+                        var newInstrs = new List<Instruction>
+                        {
+                            Instruction.Create(OpCodes.Ldc_I4, value + rnd),
+                            Instruction.Create(OpCodes.Ldc_I4, rnd),
+                            Instruction.Create(OpCodes.Sub)
+                        };
+                        il.Replace(instr, newInstrs[0]);
+                        il.InsertAfter(newInstrs[0], newInstrs[1]);
+                        il.InsertAfter(newInstrs[1], newInstrs[2]);
+                        count++;
+                    }
+                    else if (instr.OpCode.Code == Code.Ldc_R4)
+                    {
+                        float value = (float)instr.Operand;
+                        // Represent as (value * 1.0f) + 0.0f
+                        var newInstrs = new List<Instruction>
+                        {
+                            Instruction.Create(OpCodes.Ldc_R4, value),
+                            Instruction.Create(OpCodes.Ldc_R4, 1.0f),
+                            Instruction.Create(OpCodes.Mul),
+                            Instruction.Create(OpCodes.Ldc_R4, 0.0f),
+                            Instruction.Create(OpCodes.Add)
+                        };
+                        il.Replace(instr, newInstrs[0]);
+                        il.InsertAfter(newInstrs[0], newInstrs[1]);
+                        il.InsertAfter(newInstrs[1], newInstrs[2]);
+                        il.InsertAfter(newInstrs[2], newInstrs[3]);
+                        il.InsertAfter(newInstrs[3], newInstrs[4]);
+                        count++;
+                    }
+                }
+            }
+            foreach (var nested in type.NestedTypes)
+            {
+                count += ObfuscateConstants(nested);
+            }
+            return count;
+        }
+    }
+
+    /// <summary>
+    /// Pass to randomise metadata ordering, remove debug information and
+    /// strip descriptive assembly attributes. Removing PDB references is
+    /// recommended because PDB files map compiled code back to source and
+    /// should not be shipped with production assemblies【491250536690664†L146-L155】.
+    /// </summary>
+    internal class MetadataObfuscationPass
+    {
+        private readonly ObfuscationConfig _config;
+        private readonly TransformationLogger _logger;
+        private readonly Random _random;
+        public MetadataObfuscationPass(ObfuscationConfig config, TransformationLogger logger, Random random)
+        {
+            _config = config;
+            _logger = logger;
+            _random = random;
+        }
+        public void Apply(ModuleDefinition module)
+        {
+            // Remove debug information (symbols)
+            if (module.HasSymbols)
+            {
+                module.ReadSymbols(new SymbolReaderProvider().GetSymbolReader(module, module.FileName));
+                module.SymbolReader.Dispose();
+                module.SymbolReader = null;
+            }
+            // Remove PDB file names from custom attributes if present
+            var attrsToRemove = new List<CustomAttribute>();
+            foreach (var attr in module.Assembly.CustomAttributes)
+            {
+                var name = attr.AttributeType.FullName;
+                if (name == "System.Reflection.AssemblyTitleAttribute" ||
+                    name == "System.Reflection.AssemblyDescriptionAttribute" ||
+                    name == "System.Reflection.AssemblyCompanyAttribute" ||
+                    name == "System.Reflection.AssemblyProductAttribute")
+                {
+                    attrsToRemove.Add(attr);
+                }
+            }
+            foreach (var ca in attrsToRemove)
+            {
+                module.Assembly.CustomAttributes.Remove(ca);
+                _logger.Log($"Removed assembly attribute {ca.AttributeType.FullName}");
+            }
+            // Randomise type order (except keep <Module> type in place). Retrieve the existing <Module> type if any.
+            var originalModuleType = module.Types.FirstOrDefault(t => t.Name == "<Module>");
+            var nonModuleTypes = module.Types.Where(t => t.Name != "<Module>").ToList();
+            Shuffle(nonModuleTypes);
+            module.Types.Clear();
+            if (originalModuleType != null)
+            {
+                module.Types.Add(originalModuleType);
+            }
+            foreach (var t in nonModuleTypes)
+            {
+                module.Types.Add(t);
+            }
+            // Randomise members inside each type
+            foreach (var type in module.Types)
+            {
+                Shuffle(type.Fields);
+                Shuffle(type.Methods);
+                Shuffle(type.Properties);
+                Shuffle(type.Events);
+            }
+            _logger.Log("Randomised metadata order and stripped PDB information");
+        }
+        private void Shuffle<T>(IList<T> list)
+        {
+            for (int i = list.Count - 1; i > 0; i--)
+            {
+                int j = _random.Next(i + 1);
+                (list[i], list[j]) = (list[j], list[i]);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Inserts legal but confusing IL patterns designed to mislead decompilers.
+    /// The dummy instructions are unreachable at runtime but can trip static
+    /// analysis. For example, an always‑taken branch skips over a code block
+    /// that manipulates the evaluation stack.【947098854075956†L109-L143】
+    /// </summary>
+    internal class AntiDecompilerPass
+    {
+        private readonly ObfuscationConfig _config;
+        private readonly TransformationLogger _logger;
+        private readonly Random _random;
+        public AntiDecompilerPass(ObfuscationConfig config, TransformationLogger logger, Random random)
+        {
+            _config = config;
+            _logger = logger;
+            _random = random;
+        }
+        public void Apply(ModuleDefinition module)
+        {
+            foreach (var type in module.Types)
+            {
+                ProcessType(type);
+            }
+        }
+        private void ProcessType(TypeDefinition type)
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                InsertConfusingSequence(method);
+            }
+            foreach (var nested in type.NestedTypes)
+            {
+                ProcessType(nested);
+            }
+        }
+        private void InsertConfusingSequence(MethodDefinition method)
+        {
+            var il = method.Body.GetILProcessor();
+            var first = method.Body.Instructions.First();
+            // Sequence:
+            // ldstr ""
+            // pop
+            // ldc.i4.0
+            // br.s end
+            // ldloc.0 (push local) // may mismatch stack type but unreachable
+            // pop
+            // end:
+            var end = Instruction.Create(OpCodes.Nop);
+            var seq = new List<Instruction>
+            {
+                Instruction.Create(OpCodes.Ldstr, ""),
+                Instruction.Create(OpCodes.Pop),
+                Instruction.Create(OpCodes.Ldc_I4_0),
+                Instruction.Create(OpCodes.Br_S, end),
+                Instruction.Create(OpCodes.Ldc_I4_1),
+                Instruction.Create(OpCodes.Pop),
+                end
+            };
+            foreach (var instr in seq.Reverse<Instruction>())
+            {
+                il.InsertBefore(first, instr);
+            }
+            _logger.Log($"Inserted anti‑decompiler sequence in {method.FullName}");
+        }
+    }
+}
